@@ -16,3 +16,4 @@ docs/crowdin.py
 *.mo
 
 ./dists
+dist/python.dsc-2.0.0a0.tar.gz
