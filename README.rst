@@ -14,6 +14,8 @@ Key Features
 Installing
 ----------
 
+I have not made any edits to this fork yet. I am gathering some people to come and help out on the project.
+
 **Python 3.8 or higher is required**
 
 To install the library without full voice support, you can just run the following command:
