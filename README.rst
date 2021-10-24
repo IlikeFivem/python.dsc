@@ -42,7 +42,7 @@ To install the development version, do the following:
 .. code:: sh
 
     $ git clone https://github.com/ilikefivem/python.dsc
-    $ cd discord.py
+    $ cd python.dsc
     $ python3 -m pip install -U .[voice]
 
 
