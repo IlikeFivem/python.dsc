@@ -469,3 +469,294 @@ class OptionalChoice:
     def to_dict(self) -> Dict[str, Union[str, int, float]]:
         return {"name": self.name, "value": self.value}
 
+def option(name, type=None, **kwargs):
+    def decor(func):
+        nonlocal type
+        type = type or func.__annotations__.get(name, str)
+        func.__annotations__[name] = Option(type, **kwargs)
+        return func
+    return decor
+
+class SlashCommandGroup(ApplicationCommand, Option):
+    type = 1
+
+    def __new__(cls, *args, **kwargs) ->  SlashCommandGroup:
+        self = super().__new__(cls)
+
+        self.__original_kwargs__ = kwargs.copy()
+        return self
+
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        guild_ids: Optional[List[int]] = None,
+        parent_group: Optional[SlashCommandGroup] = None,
+        **kwargs
+    ) -> None:
+        validate_chat_input_name(name)
+        validate_chat_input_description(description)
+        super().__init__(
+            SlashCommandOptionType.sub_command_group,
+            name=name,
+            description=description,
+        )
+        self.subcommands: List[Union[SlashCommand, SlashCommandGroup]] = []
+        self.guild_ids = guild_ids
+        self.parent_group = parent_group
+        self.checks = []
+
+        self._before_invoke = None
+        self._after_invoke = None
+        self.cog = None
+
+        self.default_permission = kwargs.get("default_permission", True)
+        self.permissions: List[Permission] = kwargs.get("permissions", [])
+        if self.permissions and self.default_permission:
+            self.default_permission = False
+
+    def to_dict(self) -> Dict:
+        as_dict = {
+            "name": self.name,
+            "description": self.description,
+            "options": [c.to_dict() for c in self.subcommands],
+        }
+
+        if self.parent_group is not None:
+            as_dict["type"] = self.input_type.value
+
+        return as_dict
+
+    def command(self, *kwargs) -> SlashCommand:
+        def wrap(func) -> SlashCommand:
+            command = SlashCommand(func, **kwargs)
+            command.is_subcommand = True
+            self.subcommands.append(command)
+            return command
+        
+        return wrap
+
+    def command_group(self, name, description) -> SlashCommandGroup:
+        if self.parent_group is not None:
+            raise Exception("Subcommands can only be nested once")
+
+        sub_command_group = SlashCommandGroup(name, description, parent_group=self)
+        self.subcommands.append(sub_command_group)
+        return sub_command_group
+
+    async def _invoke(self, ctx: ApplicationContext) -> None:
+        option = ctx.interaction.data["options"][0]
+        command = find(lambda x: x.name == option["name"], self.subcommands)
+        ctx.interaction.data = option
+        await command.invoke(ctx)
+
+
+class ContextMenuCommand(ApplicationCommand):
+    def __new__(cls, *args, **kwargs) -> ContextMenuCommand:
+        self = super().__new__(cls)
+
+        self.__original_kwargs__ = kwargs.copy()
+        return self
+    
+    def __init__(self, func: Callable, *args, **kwargs) -> None:
+        if not asyncio.iscoroutinefunction(func):
+            raise TypeError("Callback must be a coroutine")
+        self.callback = func
+
+        self.guilds_ids: Optional[List[int]] = kwargs.get("guild_ids", None)
+
+        self.description = ""
+        self.name: str = kwargs.pop("name", func.__name__)
+        if not isinstance(self.name, str):
+            raise TypeError("Name of a command must be a string")
+        
+        self.cog = None
+
+        try:
+            checks = func.__command_checks__
+            checks.reverse()
+        except AttributeError:
+            checks = kwargs.get('checks', [])
+        
+        self.checks = checks
+        self._before_invoke = None
+        self._after_invoke = None
+
+        self.validate_parameters()
+
+        self.permissions = []
+
+    def validate_parameters(self):
+        params = self._get_signature_parameters()
+        if list(params.items())[0][0] == "self":
+            temp = list(params.items())
+            temp.pop(0)
+            params = dict(temp)
+        params = iter(params)
+
+        try:
+            next(params)
+        except StopIteration:
+            raise ClientException(f'Callback for {self.name} command is missing "ctx" parameter.')
+        
+        try:
+            next(params)
+        except StopIteration:
+            cmd = "user" if type(self) == UserCommand else "message"
+            raise ClientException(f'Callback for {self.name} command is missing "{cmd}" parameter')
+        
+        try: 
+            next(params)
+            raise ClientException(f"Callback for {self.name} command has too many parameters")
+        except StopIteration:
+            pass
+
+    def qualified_name(self):
+        return self.name
+    
+    def to_dict(self) -> Dict[str, Union[str, int]]:
+        return {"name": self.name, "description": self.description, "type": self.type}
+
+class UserCommand(ContextMenuCommand):
+    type = 2
+
+    def __new__(cls, *args, **kwargs) -> UserCommand:
+        self = super().__new__(cls)
+
+        self.__original_kwargs__ = kwargs.copy()
+        return self
+    
+    async def _invoke(self, ctx: ApplicationContext) -> None:
+        if "members" not in ctx.interaction.data["resolved"]:
+            _data = ctx.interaction.data["resolved"]["users"]
+            for i, v in _data.items():
+                v["id"] = int(i)
+                user = v
+            target = User(state=ctx.interaction._state, data=user)
+        else:
+            _data = ctx.interaction.data["resolved"]["members"]
+            for i, v in _data.items():
+                v["id"] = int(i)
+                member = v
+            _data = ctx.interaction.data["resolved"]["users"]
+            for i, v in _data.items():
+                v["id"] = int(i)
+                user = v
+            member["user"] = user
+            target = Member(data=member, guild=ctx.interaction._state._get_guild(ctx.interaction.guild_id), state=ctx.interaction._state,)
+
+        if self.cog is not None:
+            await self.callback(self.cog, ctx, target)
+        else:
+            await self.callback(ctx, target)
+
+    def copy(self):
+        ret = self.__class__(self.callback, **self.__original_kwargs__)
+        return self._ensure_assignment_on_copy(ret)
+
+    def _ensure_assignment_on_copy(self, other):
+        other._before_invoke = self._before_invoke
+        other._after_invoke = self._after_invoke
+        if self.checks != other.checks:
+            other.checks = self.checks.copy()
+
+        try:
+            other.on_error = self.on_error
+        except AttributeError:
+            pass
+        return other
+
+    def _update_copy(self, kwargs: Dict[str, Any]):
+        if kwargs:
+            kw = kwargs.copy()
+            kw.update(self.__oiginal_kwargs__)
+            copy = self.__class__(self.callback, **kw)
+            return self._ensure_assignment_on_copy(copy)
+        else:
+            return self.copy()
+
+class MessageCommand(ContextMenuCommand):
+    type = 3
+
+    def __new__(cls, *args, **kwargs) -> MessageCommand:
+        self = super().__new__(cls)
+
+        self.__original_kwargs__ = kwargs.copy()
+        return self
+    
+    async def _invoke(self, ctx: ApplicationContext):
+        _data = ctx.interaction.data["resolved"]["messages"]
+        for i, v in _data.items():
+            v["id"] = int(i)
+            message = v
+        channel = ctx.interaction._state.get_channel(int(message["channel_id"]))
+        if channel is None:
+            data = await ctx.interaction._state.http.state_private_message(int(message["author"["id"]]))
+            channel = ctx.interaction._state.add_dm_channel(data)
+        
+        target = Message(state=ctx.interaction._state, channel=channel, data=message)
+
+        if self.cog is not None:
+            await self.callback(self.cog, ctx, target)
+        else:
+            await self.callback(ctx, target)
+
+    def copy(self):
+        ret = self.__class__(self.callback, **self.__original_kwargs__)
+        return self._ensure_assignment_on_copy(ret)
+
+    def _ensure_assignment_on_copy(self, other):
+        other._before_invoke = self._before_invoke
+        other._after_invoke = self._after_invoke
+        if self.checks != other.checks:
+            other.checks = self.checks.copy()
+        
+        try: 
+            other.on_error = self.on_error
+        except AttributeError:
+            pass
+        return other
+
+    def _update_copy(self, kwargs: Dict[str, Any]):
+        if kwargs:
+            kw = kwargs.copy()
+            kw.update(self.__original_kwargs__)
+            copy = self.__class__(self.callback, **kw)
+            return self._ensure_assignment_on_copy(copy)
+        else:
+            return self.copy()
+
+def slash_command(**kwargs):
+    return application_command(cls=UserCommand, **kwargs)
+
+def message_command(**kwargs):
+    return application_command(cls=MessageCommand, **kwargs)
+
+def application_command(cls=SlashCommand, **attrs):
+    def decorator(func: Callable) -> cls:
+        if isinstance(func, ApplicationCommand):
+            func = func.callback
+        elif not callable(func):
+            raise TypeError("func needs to be a callable or a subclass of ApplicationCommand.")
+        return cls(func, **attrs)
+    
+    return decorator
+
+def command(**kwargs):
+    return application_command(**kwargs)
+
+def validate_chat_input_name(name: Any):
+    if not isinstance(name, str):
+        raise TypeError("Name of a command must be a string")
+    if " " in name:
+        raise ValidationError("Name of a chat input command cannot have spaces.")
+    if not name.islower():
+        raise ValidationError("Name of a chat input command must be a lowercase")
+    if len(name) > 32 or len(name) < 1:
+        raise ValidationError("Name of a chat input command must be less than 32 characters and non empty.")
+
+def validate_chat_input_description(description: Any):
+    if not isinstance(description, str):
+        raise TypeError("Description of a command must be a string.")
+    if len(description) > 100 or len(description) < 1:
+        raise ValidationError("Description of a chat input command must be less than 100 characters and non empty.")
