@@ -31,14 +31,20 @@ from .commands import (
     ApplicationContext,
     command,
 )
-
-#from .cog import CogMixin
+from .cog import CogMixin
 
 from .errors import Forbidden, DiscordException
 from .interactions import Interaction
+from .enums import InteractionType
 
 CoroFunc = Callable[..., Coroutine[Any, Any, Any]]
 CFT = TypeVar('CFT', bound=CoroFunc)
+
+__all__ = (
+    'ApplicationCommandMixin',
+    'Bot',
+    'AutoShardedBot',
+)
 
 class ApplicationCommandMixin:
     def __init__(self, *args, **kwargs) -> None:
@@ -262,3 +268,55 @@ class ApplicationCommandMixin:
                         file=sys.stderr,
                     )
                     raise
+    async def process_application_commands(self, interaction: Interaction) -> None:
+        if interaction.type not in (InteractionType.application_command, InteractionType.auto_complete):
+            return
+        try:
+            command = self._application_commands[interaction.data["id"]]
+        except KeyError:
+            self.dispatch("unknown_command", interaction)
+        else:
+            if interaction.type is InteractionType.auto_complete:
+                return await command.invoke_autocomplete_callback(interaction)
+
+            ctx = await self.get_application_context(interaction)
+            ctx.command = command
+            self.dispatch("application_command", ctx)
+            try:
+                if await self.can_run(ctx, call_once=True):
+                    await ctx.command.invoke(ctx)
+                else:
+                    raise CheckFailure("The global check once functions failed.")
+            except DiscordException as exc:
+                await ctx.command.dispatch_error(ctx, exc)
+            else:
+                self.dispatch("application_command_completion", ctx)
+    
+    def slash_command(self, **kwargs):
+        return self.application_command(cls=SlashCommand, **kwargs)
+    
+
+    def user_command(self, **kwargs):
+        return self.application_command(cls=UserCommand, **kwargs)
+    
+
+    def message_command(self, **kwargs):
+        return self.application_command(cls=MessageCommand, **kwargs)
+    
+    def application_command(self, **kwargs):
+        def decorator(func) -> ApplicationCommand:
+            kwargs.setdefault("parent", self)
+            result = command(**kwargs)(func)
+            self.add_application_command(result)
+            return result
+        return decorator
+    
+    def command(self, **kwargs):
+        return self.application_command(**kwargs)
+    
+    def command_group(self, name: str, description: str, guild_ids = None) -> SlashCommandGroup:
+        group = SlashCommandGroup(name, description, guild_ids)
+        self.add_application_command(group)
+        return group
+
+    
