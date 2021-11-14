@@ -319,4 +319,154 @@ class ApplicationCommandMixin:
         self.add_application_command(group)
         return group
 
+    async def get_application_context(self, interaction: Interaction, cls=None) -> ApplicationContext:
+        if cls is None:
+            cls = ApplicationContext
+        return cls(self, interaction)
+
+
+class BotBase(ApplicationCommandMixin, CogMixin):
+    _supports_prefixed_commands = False
+    def __init__(self, description=None, *args, **options):
+        # super(Client, self).__init__(*args, **kwargs)
+        # I replaced ^ with v and it worked
+        super().__init__(*args, **options)
+        self.extra_events = {}  # TYPE: Dict[str, List[CoroFunc]]
+        self.__cogs = {}  # TYPE: Dict[str, Cog]
+        self.__extensions = {}  # TYPE: Dict[str, types.ModuleType]
+        self._checks = []  # TYPE: List[Check]
+        self._check_once = []
+        self._before_invoke = None
+        self._after_invoke = None
+        self.description = inspect.cleandoc(description) if description else ""
+        self.owner_id = options.get("owner_id")
+        self.owner_ids = options.get("owner_ids", set())
+
+        self.debug_guild = options.pop(
+            "debug_guild", None
+        )  # TODO: remove or reimplement
+        self.debug_guilds = options.pop("debug_guilds", None)
+
+        if self.owner_id and self.owner_ids:
+            raise TypeError("Both owner_id and owner_ids are set.")
+
+        if self.owner_ids and not isinstance(
+            self.owner_ids, collections.abc.Collection
+        ):
+            raise TypeError(
+                f"owner_ids must be a collection not {self.owner_ids.__class__!r}"
+            )
+
+        if self.debug_guild:
+            if self.debug_guilds is None:
+                self.debug_guilds = [self.debug_guild]
+            else:
+                raise TypeError("Both debug_guild and debug_guilds are set.")
+
+        self._checks = []
+        self._check_once = []
+        self._before_invoke = None
+        self._after_invoke = None
+    async def on_connect(self):
+        await self.register_commands()
     
+    async def on_interaction(self, interaction):
+        await self.process_application_commands(interaction)
+    
+    async def on_application_command_error(self, context: ApplicationContext, exception: DiscordException) -> None:
+        if self.extra_events.get('on_application_command_error', None):
+            return
+
+        command = context.command
+        if command and command.has_error_handler():
+            return
+
+        cog = context.cog
+        if cog and cog.has_error_handler():
+            return
+
+        print(f"Ignoring exception in command {context.command}:", file=sys.stderr)
+        traceback.print_exception(type(exception), exception, exception.__traceback__, file=sys.stderr)
+
+
+    def check(self, func):
+        self.add_check(func)
+        return func
+
+    def add_check(self, func, *, call_once: bool = False) -> None:
+        if call_once:
+            self._check_once.append(func)
+        else:
+            self._checks.append(func)
+        
+    def remove_check(self, func, *, call_once: bool = False) -> None:
+        l = self._check_once if call_once else self._checks
+        try:
+            l.remove(func)
+        except ValueError:
+            pass
+    
+
+    def check_once(self, func):
+        self.add_check(func, call_once=True)
+        return func
+    
+    async def can_run(self, ctx: ApplicationCommand, *, call_once: bool = False) -> bool:
+        data = self._check_once if call_once else self._checks
+
+        if len(data) == 0:
+            return True
+        
+        return await async_all(f(ctx) for f in data)
+
+    def add_listener(self, func: CoroFunc, name: str = MISSING) -> None:
+        name = func.__name__ if name is MISSING else name
+
+        if not asyncio.iscoroutinefunction(func):
+            raise TypeError('Listeners must be coroutines')
+
+        if name in self.extra_events:
+            self.extra_events[name].append(func)
+        else:
+            self.extra_events[name] = [func]
+        
+    def remove_listeners(self, func: CoroFunc, name: str = MISSING) -> None:
+        name = func.__name__ if name is MISSING else name
+
+        if name in self.extra_events:
+            try:
+                self.extra_events[name].remove(func)
+            except ValueError:
+                pass
+    
+    def listen(self, name: str = MISSING) -> Callable[[CFT], CFT]:
+        def decorator(func: CFT) -> CFT:
+            self.add_listener(func, name)
+            return func
+        return decorator
+    
+    def dispatch(self, event_name: str, *args: Any, **kwargs: Any) -> None:
+        super().dispatch(event_name, *args, **kwargs)
+        ev = 'on_' + event_name
+        for event in self.extra_events.get(ev, []):
+            self._scheduled_event(event, ev, *args, **kwargs)
+    
+    def before_invoke(self, coro):
+        if not asyncio.iscoroutinefunction(coro):
+            raise TypeError("The pre-invoke hook must be a coroutine.")
+
+        self._before_invoke = coro
+        return coro
+    
+    def after_invoke(self, coro):
+        if not asyncio.iscoroutinefunction(coro):
+            raise TypeError("The post-invoke hook must be a coroutine.")
+        
+        self._after_invoke = coro
+        return coro
+
+class Bot(BotBase, Client):
+    pass
+
+class AutoShardedBot(BotBase, AutoShardedClient):
+    pass
